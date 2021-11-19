@@ -1,0 +1,159 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Generate dummy portfolio 
+
+```{r}
+require(dplyr)
+n <- 10e3
+n_size <- 5
+n_industry <- 20
+portfolio <- data.frame(risk_id = 1:n, 
+                        industry = sample(1:n_industry, n, replace = T),
+                        size = sample(1:n_size, n, replace = T),
+                        e_commerce = sample(c(1,2), n, replace = T),
+                        deductible =  sample(c(500, 1000, 2000), 
+                                             n, 
+                                             replace = T),
+                        limit = sample(c(100e3, 1000e3), 
+                                       n, 
+                                       replace = T))
+
+```
+
+
+Risk Model
+
+1. Parameter for Frequency
+```{r}
+lambda_base <- 1/100
+share_targeted <- 0.8
+lambda_targeted <- lambda_base * share_targeted
+
+# Success probabilty of untargeted attacks is drawn with beta distribution
+success_prob_event_expected <- 0.1
+get_success_prob <- function()
+{
+  return(rbeta(1, 0.5, 4.5))
+}
+
+lambda_untargeted <- lambda_base * ( 1 - share_targeted) / success_prob_event_expected * 0.8
+lambda_untargeted_all_industries <- lambda_untargeted * 0.2/0.8
+
+# Effect of Industry on Frequency
+f_1 <- ((0:(n_industry-1))/n_industry - 0.5) * 0.2 + 1
+names(f_1) <- 1:n_industry
+
+# Effect of size (turnover bins)
+f_2 <- ((0:(n_size-1))/n_size - 0.3) * 0.2 + 1
+names(f_2) <- 1:n_size
+
+# Effect of ecommerce/non-ecommerce
+f_3 <- c(0.8, 1)
+names(f_3) <- c(1,2)
+
+# Calculate the expected frequency of targeted attacks for each insured
+portfolio <- portfolio %>% 
+  mutate(lambda_targeted = unname(lambda_targeted * f_1[industry] * f_2[size] * f_3[e_commerce]))
+
+# Lambda for untargeted attack on each industry
+lambda_untargeted_per_industry <- f_1 * (lambda_untargeted - lambda_untargeted_all_industries) 
+
+stopifnot(lambda_untargeted_all_industries < min(f_1) * lambda_untargeted)
+
+
+
+```
+
+2. Parameter for severity
+```{r}
+mu <- 8
+sigma <- 2
+sim_severity <- function(number){return(rlnorm(number, mu, sigma))}
+
+sim_insured_loss <- function(number, deductible, limit){
+  if(number == 0){return(0)}
+  return(sum(pmin(pmax(sim_severity(number)-deductible, 0), limit)))
+}
+```
+
+3. Simulation Model for one year
+```{r}
+get_loss_per_event <- function(industry)
+{
+    relevant_portfolio <- portfolio[portfolio$industry == industry,]
+    success <- rbinom(length(relevant_portfolio$industry), 1, get_success_prob())
+    return(sum(unlist(lapply(1:length(relevant_portfolio$industry), function(x) ifelse(success[x] == 0, 
+                                                                                       return(0), 
+                                                                                       return(sim_insured_loss(1,
+                                                                                                               relevant_portfolio$deductible[x],
+                                                                                                               relevant_portfolio$limit[x])))))))
+}
+get_loss_per_event_all_industries <- function()
+{
+  success <- rbinom(length(portfolio$industry), 1, get_success_prob())
+  return(sum(unlist(lapply(1:length(portfolio$industry), function(x) ifelse(success[x] == 0, 
+                                                                            return(0), 
+                                                                            return(sim_insured_loss(1,
+                                                                                                    portfolio$deductible[x],
+                                                                                                    portfolio$limit[x])))))))
+}
+
+get_loss_single_industry <- function(industry, events_per_industry)
+{
+    number_events <- events_per_industry[industry]
+    ifelse(number_events == 0, 
+           return(c(0)),
+           return(sum(unlist(lapply(1:number_events,
+                         function(x) get_loss_per_event(industry)
+                         )))))
+}
+
+get_loss_per_industry <- function(events_per_industry)
+  {
+  unlist(lapply(1:n_industry, function(x) get_loss_single_industry(x, events_per_industry)))
+}
+
+
+simulate_year <- function(portfolio)
+{
+  portfolio$number_targeted <- unlist(lapply(portfolio$lambda_targeted , function(lambda){return(rpois(1,lambda))}))
+  portfolio$agg_losses <- unlist(mapply(sim_insured_loss, portfolio$number_targeted, portfolio$deductible, portfolio$limit))
+  
+  events_per_industry <- unlist(lapply(lambda_untargeted_per_industry , function(lambda){return(rpois(1,lambda))}))
+  events_all_industries <- rpois(1, lambda_untargeted_all_industries)
+  
+  loss_events_per_industry <- get_loss_per_industry(events_per_industry)
+  loss_events_all_industry <- ifelse(events_all_industries == 0, 
+                                     c(0),
+                                     unlist(lapply(1:events_all_industries,
+                                                    function(event) get_loss_per_event_all_industries()
+                                                      )))
+  event_loss <- sum(loss_events_per_industry) + loss_events_all_industry
+  total_loss <- event_loss + sum(portfolio$agg_losses)
+  return(total_loss)
+}
+simulate_year(portfolio)
+```
+
+4. Simulate multiple years
+```{r}
+tictoc::tic()
+years <- vapply(1:10000, function(x)simulate_year(portfolio), FUN.VALUE = c(1))
+tictoc::toc()
+```
+
+5. Plot AEP
+```{r}
+library(ggplot2)
+AEP <- data.frame(loss = sort(years), return_period = c(1/(((length(years)-1):1)/length(years)), 99e9))
+ggplot(data=AEP, aes(x=return_period, y=loss, group=1)) +
+  geom_line() + 
+  xlim(c(0, 1000)) + ylim(c(0, 30e6)) + 
+  geom_hline(yintercept = mean(years))
+```
+
+
+
